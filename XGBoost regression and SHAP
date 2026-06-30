@@ -649,11 +649,5 @@ cbar.ax.text(
 )
 cbar.set_label("Feature value", fontsize=10, labelpad=8)
 
-plt.savefig(
-    "PHD/Research two/DependenceplotSHAP_new2.tif",
-    dpi=300,
-    bbox_inches="tight",
-    facecolor="white"
-)
 
 plt.show()
