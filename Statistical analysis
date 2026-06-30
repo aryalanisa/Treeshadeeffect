@@ -1,0 +1,109 @@
+#Import libraries
+import pandas as pd
+import numpy as np
+from scipy.stats import shapiro
+from scipy.stats import levene
+from scipy.stats import f
+
+
+df = pd.read_csv("File/dataset.csv")
+
+#Shapiro wilk test to  check normality of data
+
+stat, p = shapiro(df["Temperature_difference"])
+print("Shapiro-Wilk statistic:", stat)
+print("p-value:", p)
+
+#Levene test
+groups = [
+    group["Temperature_difference"].dropna()
+    for name, group in df.groupby(["Location", "Landcover"])
+]
+
+stat, p = levene(*groups)
+
+print("Levene's statistic:", stat)
+print("p-value:", p)
+
+dv = "Temperature_difference"
+A = "Location"
+B = "Landcover"
+
+# Clean data
+df2 = df[[dv, A, B]].dropna().copy()
+
+df2[A] = df2[A].astype("category")
+df2[B] = df2[B].astype("category")
+
+# Grand mean
+y = df2[dv].to_numpy()
+grand_mean = y.mean()
+
+# Means
+mean_A = df2.groupby(A)[dv].mean()
+mean_B = df2.groupby(B)[dv].mean()
+mean_AB = df2.groupby([A, B])[dv].mean()
+
+# Counts
+n_A = df2.groupby(A)[dv].size()
+n_B = df2.groupby(B)[dv].size()
+n_AB = df2.groupby([A, B])[dv].size()
+
+# Total SS
+SS_total = ((df2[dv] - grand_mean) ** 2).sum()
+
+# SS for A
+SS_A = sum(n_A[a] * (mean_A[a] - grand_mean) ** 2 for a in mean_A.index)
+
+# SS for B
+SS_B = sum(n_B[b] * (mean_B[b] - grand_mean) ** 2 for b in mean_B.index)
+
+# SS for interaction
+# SS_AB = sum over cells: n_ab * (mean_ab - mean_a - mean_b + grand_mean)^2
+SS_AB = 0.0
+for (a, b), m_ab in mean_AB.items():
+    SS_AB += n_AB[(a, b)] * (m_ab - mean_A[a] - mean_B[b] + grand_mean) ** 2
+
+# Error SS
+SS_error = SS_total - SS_A - SS_B - SS_AB
+
+# Degrees of freedom
+a_levels = df2[A].cat.categories.size
+b_levels = df2[B].cat.categories.size
+N = len(df2)
+
+df_A = a_levels - 1
+df_B = b_levels - 1
+df_AB = df_A * df_B
+df_error = N - (a_levels * b_levels)
+df_total = N - 1
+
+# Mean squares
+MS_A = SS_A / df_A if df_A > 0 else np.nan
+MS_B = SS_B / df_B if df_B > 0 else np.nan
+MS_AB = SS_AB / df_AB if df_AB > 0 else np.nan
+MS_error = SS_error / df_error if df_error > 0 else np.nan
+
+# F and p
+F_A = MS_A / MS_error
+F_B = MS_B / MS_error
+F_AB = MS_AB / MS_error
+
+p_A = 1 - f.cdf(F_A, df_A, df_error)
+p_B = 1 - f.cdf(F_B, df_B, df_error)
+p_AB = 1 - f.cdf(F_AB, df_AB, df_error)
+
+anova = pd.DataFrame(
+    {
+        "SS": [SS_A, SS_B, SS_AB, SS_error, SS_total],
+        "df": [df_A, df_B, df_AB, df_error, df_total],
+        "MS": [MS_A, MS_B, MS_AB, MS_error, np.nan],
+        "F":  [F_A,  F_B,  F_AB,  np.nan,  np.nan],
+        "p":  [p_A,  p_B,  p_AB,  np.nan,  np.nan],
+    },
+    index=[A, B, f"{A}:{B}", "Residual", "Total"]
+)
+
+print("=== Two-way ANOVA (SciPy-based, classical SS) ===")
+print(anova)
+
