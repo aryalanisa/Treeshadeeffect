@@ -1,0 +1,245 @@
+import pandas as pd
+import numpy as np
+import optuna
+import matplotlib.pyplot as plt
+
+from sklearn.model_selection import KFold, cross_val_score
+from sklearn.metrics import r2_score, mean_squared_error, make_scorer
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.impute import SimpleImputer
+
+from xgboost import XGBRegressor
+
+
+df = pd.read_csv ("PHD/Newdataset.csv")
+
+
+# 1. SETTINGS
+
+target_col = df["Temperature_difference"]
+
+numeric_feats = [
+    "Agriculture",
+    "Forest",
+    "Grassland",
+    "Water",
+    "CanopyCover",
+    "Imperviousdensity",
+    "MeanCanopyHeight",
+    "CanopyH_cv_20",
+    "CanopyH_p95p5_20",
+    "Shannon_landcover",
+    "Vegetation",
+    "GreenImperviousRatio",
+    "log_Distancetowater",
+    "log_Distancetoforest",
+    "Hour"
+]
+
+categorical_feats = ["Surface", "Location", "Year"]
+
+seed = 42
+
+
+# =========================
+# 2. LOAD X, y
+# =========================
+X = df[numeric_feats + categorical_feats].copy()
+y = df[target_col].copy()
+
+
+# =========================
+# 3. PREPROCESSING
+# =========================
+numeric_transformer = Pipeline(steps=[
+    ("imputer", SimpleImputer(strategy="median")),
+    ("scaler", StandardScaler())
+])
+
+categorical_transformer = Pipeline(steps=[
+    ("imputer", SimpleImputer(strategy="most_frequent")),
+    ("onehot", OneHotEncoder(handle_unknown="ignore"))
+])
+
+preprocessor = ColumnTransformer(
+    transformers=[
+        ("num", numeric_transformer, numeric_feats),
+        ("cat", categorical_transformer, categorical_feats)
+    ]
+)
+
+
+# =========================
+# 4. OUTER CROSS-VALIDATION
+# =========================
+outer_cv = KFold(n_splits=5, shuffle=True, random_state=seed)
+
+outer_rmse = []
+outer_r2 = []
+
+last_y_test = None
+last_y_pred = None
+last_r2 = None
+
+for fold, (train_idx, test_idx) in enumerate(outer_cv.split(X), start=1):
+    print(f"\n=== Fold {fold} ===")
+
+    X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
+    y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
+
+    # =========================
+    # 5. OPTUNA OBJECTIVE
+    # =========================
+    def objective(trial):
+        params = {
+            "n_estimators": trial.suggest_int("n_estimators", 100, 500),
+            "max_depth": trial.suggest_int("max_depth", 3, 10),
+            "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.3, log=True),
+            "subsample": trial.suggest_float("subsample", 0.8, 1.0),
+            "colsample_bytree": trial.suggest_float("colsample_bytree", 0.8, 1.0),
+            "gamma": trial.suggest_float("gamma", 0, 5),
+            "reg_alpha": trial.suggest_float("reg_alpha", 1e-8, 10.0, log=True),
+            "reg_lambda": trial.suggest_float("reg_lambda", 1e-8, 10.0, log=True),
+            "objective": "reg:squarederror",
+            "random_state": seed,
+            "n_jobs": 1
+        }
+
+        model = XGBRegressor(**params)
+
+        pipe = Pipeline(steps=[
+            ("preprocessor", preprocessor),
+            ("model", model)
+        ])
+
+        scores = cross_val_score(
+            pipe,
+            X_train,
+            y_train,
+            cv=3,
+            scoring=make_scorer(mean_squared_error, greater_is_better=False),
+            n_jobs=1
+        )
+
+        return np.mean(scores)
+
+    sampler = optuna.samplers.TPESampler(seed=seed)
+
+    study = optuna.create_study(
+        direction="maximize",
+        sampler=sampler
+    )
+
+    study.optimize(
+        objective,
+        n_trials=10,
+        show_progress_bar=False
+    )
+
+    best_params = study.best_params
+
+    best_params.update({
+        "objective": "reg:squarederror",
+        "random_state": seed,
+        "n_jobs": 1
+    })
+
+    # =========================
+    # 6. FINAL MODEL FOR THIS FOLD
+    # =========================
+    final_model = XGBRegressor(**best_params)
+
+    final_pipe = Pipeline(steps=[
+        ("preprocessor", preprocessor),
+        ("model", final_model)
+    ])
+
+    final_pipe.fit(X_train, y_train)
+
+    y_pred = final_pipe.predict(X_test)
+
+    rmse = np.sqrt(mean_squared_error(y_test, y_pred))
+    r2 = r2_score(y_test, y_pred)
+
+    print(f"Fold {fold} RMSE: {rmse:.4f}")
+    print(f"Fold {fold} R2: {r2:.4f}")
+
+    outer_rmse.append(rmse)
+    outer_r2.append(r2)
+
+    last_y_test = y_test
+    last_y_pred = y_pred
+    last_r2 = r2
+
+
+# =========================
+# 7. SUMMARY RESULTS
+# =========================
+print("\nOuter CV RMSEs:", outer_rmse)
+print("Mean RMSE:", np.mean(outer_rmse), "±", np.std(outer_rmse))
+
+print("\nOuter CV R2s:", outer_r2)
+print("Mean R2:", np.mean(outer_r2), "±", np.std(outer_r2))
+
+
+# =========================
+# 8. PLOT LAST FOLD
+# =========================
+plt.figure(figsize=(7, 7))
+
+plt.scatter(last_y_test, last_y_pred, alpha=0.7, edgecolor="k")
+
+plt.plot(
+    [last_y_test.min(), last_y_test.max()],
+    [last_y_test.min(), last_y_test.max()],
+    "r--",
+    lw=2
+)
+
+plt.xlabel("Observed")
+plt.ylabel("Predicted")
+plt.title("Model Performance: XGBoost")
+
+plt.text(
+    0.05,
+    0.95,
+    f"$R^2$ = {last_r2:.2f}",
+    transform=plt.gca().transAxes,
+    fontsize=12,
+    verticalalignment="top",
+    bbox=dict(boxstyle="round", facecolor="white", alpha=0.7)
+)
+
+# plt.savefig("File/Modelperformance_new.tif", bbox_inches="tight", dpi=300)
+plt.show()
+
+feature_name_map = {
+   "Agriculture": "Agriculture %",
+    "Forest": "Forest %",
+    "Grassland": "Grassland %",
+    "Water": "Water %",
+    "CanopyCover": "Tree cover density",
+    "Imperviousdensity": "Imperviousness density",
+    "MeanCanopyHeight": "Mean canopy height",
+    "CanopyH_cv_20": "Variation in canopy height",
+    "CanopyH_p95p5_20": "Height range of trees",
+    "Shannon_landcover": "Landscape diversity",
+    "Vegetation": "Total vegetation % in an area",
+    "GreenImperviousRatio": "Green-Impervious ratio",
+    "log_Distancetowater": "Distance to water",
+    "log_Distancetoforest": "Distance to forest",
+    "CanopyCoolingPotential": "Canopy cooling potential",
+    "TreeStructure": "Tree structure",
+    "Hour": "Hour of the day"
+      
+}
+X_plot = X.copy()
+X_plot.columns = [feature_name_map.get(c, c) for c in X.columns]
+# ==============================
+# Train final model
+# ==============================
+best_params = study.best_params
+final_model = xgb.XGBRegressor(**best_params)
+final_model.fit(X, Y)
